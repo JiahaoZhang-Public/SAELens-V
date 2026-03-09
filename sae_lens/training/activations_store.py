@@ -27,15 +27,19 @@ from sae_lens.config import (
 )
 from sae_lens.sae import SAE
 from sae_lens.tokenization_and_batching import concat_and_batch_sequences
-import pynvml
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    _NVML_AVAILABLE = True
+except Exception:
+    _NVML_AVAILABLE = False
 
 GPU_THRESHOLD = 0.5
-
-# 初始化 NVML
-pynvml.nvmlInit()
-num_gpus =7
+num_gpus = 7
 
 def get_available_gpu(threshold=GPU_THRESHOLD):
+    if not _NVML_AVAILABLE:
+        return None
     for i in range(num_gpus):
         handle = pynvml.nvmlDeviceGetHandleByIndex(i)
         mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
@@ -260,7 +264,7 @@ class ActivationsStore:
 
         else:
             print(
-                "Warning: Dataset is not tokenized. “
+                "Warning: Dataset is not tokenized."
             )
 
         self.iterable_sequences = self._iterate_tokenized_sequences()
