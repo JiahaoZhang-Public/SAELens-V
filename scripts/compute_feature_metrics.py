@@ -11,7 +11,10 @@ For each of the 65536 SAE features, computes three metrics:
 
 Usage:
     conda activate sae-v
+    # Local (Apple Silicon):
     python scripts/compute_feature_metrics.py --n_samples 50
+    # GPU server:
+    python scripts/compute_feature_metrics.py --n_samples 500 --dtype float16
 
 Output:
     output/feature_metrics/feature_metrics.npz
@@ -27,6 +30,8 @@ import time
 
 # Allow MPS to use full unified memory (Apple Silicon shares CPU/GPU memory)
 os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+# Disable HuggingFace XET CDN (causes 401 errors on some networks)
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 import torch
 import torch.nn.functional as F
@@ -46,11 +51,28 @@ from transformer_lens.HookedLlava import HookedLlava
 # ---------------------------------------------------------------------------
 
 def get_device():
-    if torch.backends.mps.is_available():
-        return "mps"
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         return "cuda:0"
+    elif torch.backends.mps.is_available():
+        return "mps"
     return "cpu"
+
+
+def _empty_cache(device):
+    """Release cached memory on MPS or CUDA."""
+    if device == "mps":
+        torch.mps.empty_cache()
+    elif "cuda" in str(device):
+        torch.cuda.empty_cache()
+
+
+def _gpu_mem_str(device):
+    """Return a string describing current GPU memory usage."""
+    if "cuda" in str(device):
+        alloc = torch.cuda.memory_allocated(device) / 1e9
+        total = torch.cuda.get_device_properties(device).total_memory / 1e9
+        return f"[GPU {alloc:.1f}/{total:.1f} GB]"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +101,7 @@ def load_models(model_path, sae_path, device, dtype=torch.float32):
         fold_ln=False,
         center_writing_weights=False,
         center_unembed=False,
-        tokenizer=None,
+        tokenizer=processor.tokenizer,  # pass local tokenizer to avoid HF downloads
         dtype=dtype,
         vision_tower=vision_tower,
         multi_modal_projector=multi_modal_projector,
@@ -89,14 +111,12 @@ def load_models(model_path, sae_path, device, dtype=torch.float32):
     # Aggressively free the original model
     del vision_model, language_model, vision_tower, multi_modal_projector
     gc.collect()
-    if device == "mps":
-        torch.mps.empty_cache()
+    _empty_cache(device)
 
     print(f"     Moving model to {device} ...")
     hook_language_model = hook_language_model.to(device)
     gc.collect()
-    if device == "mps":
-        torch.mps.empty_cache()
+    _empty_cache(device)
 
     print(f"[4/4] Loading SAE from {sae_path} ...")
     sae = SAE.load_from_pretrained(path=sae_path, device=device)
@@ -154,10 +174,16 @@ def compute_metrics(args):
     stop_at_layer = int(hook_name.split(".")[1]) + 1  # 17
 
     # ---- Load dataset ----
-    from datasets import load_dataset
-    print(f"\nLoading {args.n_samples} samples from openbmb/RLAIF-V-Dataset ...")
-    ds = load_dataset("openbmb/RLAIF-V-Dataset", split=f"train[:{args.n_samples}]")
-    print(f"  Loaded {len(ds)} samples.")
+    from datasets import load_dataset, load_from_disk
+    if args.dataset_path and os.path.isdir(args.dataset_path):
+        print(f"\nLoading dataset from local path: {args.dataset_path} ...")
+        ds = load_from_disk(args.dataset_path)
+        if args.n_samples < len(ds):
+            ds = ds.select(range(args.n_samples))
+    else:
+        print(f"\nLoading {args.n_samples} samples from openbmb/RLAIF-V-Dataset ...")
+        ds = load_dataset("openbmb/RLAIF-V-Dataset", split=f"train[:{args.n_samples}]")
+    print(f"  Loaded {len(ds)} samples.  {_gpu_mem_str(device)}")
 
     # ---- Accumulators  (float64 for numerical stability) ----
     text_act_sum = np.zeros(d_sae, dtype=np.float64)
@@ -255,12 +281,11 @@ def compute_metrics(args):
         del fa, hs, fa_device, feature_acts, hidden_states, text_acts, image_acts
         del inputs, image_indice
         gc.collect()
-        if device == "mps":
-            torch.mps.empty_cache()
+        _empty_cache(device)
 
     elapsed = time.time() - t0
     print(f"\nProcessed {n_processed}/{len(ds)} samples in {elapsed:.1f}s "
-          f"({elapsed / max(n_processed, 1):.1f}s/sample)")
+          f"({elapsed / max(n_processed, 1):.1f}s/sample)  {_gpu_mem_str(device)}")
 
     # ---- Compute final metrics ----
     eps = 1e-8
@@ -439,6 +464,8 @@ def main():
     parser.add_argument("--sae_path", default="model/SAE-V/SAEV_LLaVA_NeXT-7b_OBELICS")
     parser.add_argument("--n_samples", type=int, default=50,
                         help="Number of RLAIF-V samples to process")
+    parser.add_argument("--dataset_path", default=None,
+                        help="Path to pre-downloaded dataset (from datasets.save_to_disk)")
     parser.add_argument("--output_dir", default="output/feature_metrics")
     parser.add_argument("--dtype", default="float16", choices=["float32", "float16"],
                         help="Model dtype (float16 saves memory)")
