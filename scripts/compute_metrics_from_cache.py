@@ -2,8 +2,8 @@
 """
 Phase 2: Compute feature metrics from cached SAE activations.
 
-Loads the chunk files produced by cache_activations.py (Phase 1) and
-computes aggregate metrics without needing the model or GPU.
+Uses streaming accumulation — processes one chunk at a time to avoid
+loading all data into memory (~73GB for 83k samples). Memory usage: ~100MB.
 
 Metrics computed:
   1. Normalized Modality Ratio — mean activation per modality (token-count normalized)
@@ -19,14 +19,17 @@ Usage:
 import os
 import sys
 import json
+import time
 import argparse
 import glob
 
 import numpy as np
+from tqdm import tqdm
 
 
-def load_all_chunks(cache_dir):
-    """Load and concatenate all chunk files from cache directory."""
+def compute_metrics_streaming(cache_dir, output_dir):
+    """Stream chunks one at a time, accumulating into (d_sae,) arrays."""
+
     meta_path = os.path.join(cache_dir, "meta.json")
     if not os.path.exists(meta_path):
         raise FileNotFoundError(f"No meta.json found in {cache_dir}")
@@ -34,94 +37,70 @@ def load_all_chunks(cache_dir):
     with open(meta_path) as f:
         meta = json.load(f)
 
+    d_sae = meta["d_sae"]
+    n_processed = meta["n_processed"]
+
     print(f"Cache metadata:")
-    print(f"  Samples: {meta['n_processed']} (of {meta.get('n_total', '?')})")
-    print(f"  d_sae: {meta['d_sae']}")
+    print(f"  Samples: {n_processed}")
+    print(f"  d_sae: {d_sae}")
     print(f"  hook: {meta['hook_name']}")
     print(f"  Chunks: {meta['n_chunks']}")
     if "total_time_s" in meta:
-        print(f"  Caching took: {meta['total_time_s']:.1f}s "
+        print(f"  Phase 1 took: {meta['total_time_s']:.1f}s "
               f"({meta.get('avg_time_per_sample_s', 0):.2f}s/sample)")
     print()
 
-    # Load all chunks in order
     chunk_files = sorted(glob.glob(os.path.join(cache_dir, "chunk_*.npz")))
-    print(f"Loading {len(chunk_files)} chunk files ...")
+    print(f"Streaming {len(chunk_files)} chunks (memory-efficient) ...")
 
-    all_text_act = []
-    all_image_act = []
-    all_n_text = []
-    all_n_image = []
-    all_alignment = []
-    all_alignment_mask = []
-    all_active_mask = []
+    # Accumulators — only (d_sae,) shaped, ~3MB total
+    total_text_act = np.zeros(d_sae, dtype=np.float64)
+    total_image_act = np.zeros(d_sae, dtype=np.float64)
+    total_text_tokens = 0
+    total_image_tokens = 0
+    sample_active = np.zeros(d_sae, dtype=np.int64)
+    alignment_sum = np.zeros(d_sae, dtype=np.float64)
+    alignment_count = np.zeros(d_sae, dtype=np.int64)
+    n_samples = 0
 
-    for cf in chunk_files:
+    t0 = time.time()
+    for cf in tqdm(chunk_files, desc="Processing chunks", unit="chunk"):
         data = np.load(cf)
-        all_text_act.append(data["text_act_sum"].astype(np.float32))
-        all_image_act.append(data["image_act_sum"].astype(np.float32))
-        all_n_text.append(data["n_text"])
-        all_n_image.append(data["n_image"])
-        all_alignment.append(data["alignment"].astype(np.float32))
-        all_alignment_mask.append(data["alignment_mask"])
-        all_active_mask.append(data["active_mask"])
 
-    text_act_sum = np.concatenate(all_text_act, axis=0)    # (N, d_sae)
-    image_act_sum = np.concatenate(all_image_act, axis=0)  # (N, d_sae)
-    n_text = np.concatenate(all_n_text, axis=0)            # (N,)
-    n_image = np.concatenate(all_n_image, axis=0)          # (N,)
-    alignment = np.concatenate(all_alignment, axis=0)       # (N, d_sae)
-    alignment_mask = np.concatenate(all_alignment_mask, axis=0)  # (N, d_sae)
-    active_mask = np.concatenate(all_active_mask, axis=0)   # (N, d_sae)
+        text_act = data["text_act_sum"].astype(np.float64)   # (chunk, d_sae)
+        image_act = data["image_act_sum"].astype(np.float64)  # (chunk, d_sae)
 
-    n_samples = text_act_sum.shape[0]
-    d_sae = text_act_sum.shape[1]
-    print(f"Loaded {n_samples} samples, d_sae={d_sae}")
+        total_text_act += text_act.sum(axis=0)
+        total_image_act += image_act.sum(axis=0)
+        total_text_tokens += data["n_text"].sum()
+        total_image_tokens += data["n_image"].sum()
 
-    return {
-        "text_act_sum": text_act_sum,
-        "image_act_sum": image_act_sum,
-        "n_text": n_text,
-        "n_image": n_image,
-        "alignment": alignment,
-        "alignment_mask": alignment_mask,
-        "active_mask": active_mask,
-        "n_samples": n_samples,
-        "d_sae": d_sae,
-        "meta": meta,
-    }
+        sample_active += data["active_mask"].sum(axis=0)
 
+        align = data["alignment"].astype(np.float64)
+        align_mask = data["alignment_mask"]
+        alignment_sum += (align * align_mask).sum(axis=0)
+        alignment_count += align_mask.sum(axis=0)
 
-def compute_metrics(data, output_dir):
-    """Compute aggregate metrics from cached per-sample data."""
+        n_samples += text_act.shape[0]
 
-    n_samples = data["n_samples"]
-    d_sae = data["d_sae"]
+    elapsed = time.time() - t0
+    print(f"\nStreaming done: {n_samples} samples in {elapsed:.1f}s "
+          f"({elapsed/len(chunk_files)*1000:.1f}ms/chunk)")
+
     eps = 1e-8
 
-    print(f"\nComputing metrics for {n_samples} samples, {d_sae} features ...")
-
-    # ---- 1. Normalized Modality Ratio ----
-    # Global mean activation per feature per modality (normalized by token count)
-    total_text_act = data["text_act_sum"].sum(axis=0)      # (d_sae,)
-    total_image_act = data["image_act_sum"].sum(axis=0)    # (d_sae,)
-    total_text_tokens = data["n_text"].sum()
-    total_image_tokens = data["n_image"].sum()
-
+    # 1. Normalized Modality Ratio
     mean_text = total_text_act / (total_text_tokens + eps)
     mean_image = total_image_act / (total_image_tokens + eps)
     modality_ratio = (mean_image - mean_text) / (mean_image + mean_text + eps)
 
-    print(f"  Token totals: {total_text_tokens} text, {total_image_tokens} image")
+    print(f"  Token totals: {int(total_text_tokens)} text, {int(total_image_tokens)} image")
 
-    # ---- 2. Activation Frequency ----
-    sample_active = data["active_mask"].sum(axis=0)        # (d_sae,) int
+    # 2. Activation Frequency
     frequency = sample_active / n_samples
 
-    # ---- 3. Cross-Modal Alignment Score ----
-    # Average alignment across samples where the feature was active on both modalities
-    alignment_sum = (data["alignment"] * data["alignment_mask"]).sum(axis=0)
-    alignment_count = data["alignment_mask"].sum(axis=0)
+    # 3. Cross-Modal Alignment Score
     with np.errstate(divide="ignore", invalid="ignore"):
         alignment_score = np.where(
             alignment_count > 0,
@@ -130,38 +109,38 @@ def compute_metrics(data, output_dir):
         )
     alignment_score = np.nan_to_num(alignment_score, nan=0.0)
 
-    # ---- Save ----
+    # Save
     os.makedirs(output_dir, exist_ok=True)
     save_path = os.path.join(output_dir, "feature_metrics.npz")
     np.savez(
         save_path,
-        modality_ratio=modality_ratio,
-        alignment=alignment_score,
-        frequency=frequency,
-        mean_text=mean_text,
-        mean_image=mean_image,
+        modality_ratio=modality_ratio.astype(np.float32),
+        alignment=alignment_score.astype(np.float32),
+        frequency=frequency.astype(np.float32),
+        mean_text=mean_text.astype(np.float32),
+        mean_image=mean_image.astype(np.float32),
         alignment_count=alignment_count.astype(np.int32),
         sample_active=sample_active.astype(np.int32),
         n_samples=n_samples,
-        text_token_total=total_text_tokens,
-        image_token_total=total_image_tokens,
+        text_token_total=int(total_text_tokens),
+        image_token_total=int(total_image_tokens),
     )
-    print(f"  Saved metrics → {save_path}")
+    print(f"  Saved metrics -> {save_path}")
 
-    # ---- Print summary ----
+    # Print summary
     alive = frequency > 0
     n_alive = alive.sum()
     print(f"\n{'='*60}")
     print(f"Feature summary ({n_alive}/{d_sae} alive features):")
     print(f"  Text-dominant  (ratio < -0.8): {(modality_ratio[alive] < -0.8).sum()}")
     print(f"  Image-dominant (ratio >  0.8): {(modality_ratio[alive] >  0.8).sum()}")
-    print(f"  Cross-modal    (|ratio| ≤ 0.8): {(np.abs(modality_ratio[alive]) <= 0.8).sum()}")
+    print(f"  Cross-modal    (|ratio| <= 0.8): {(np.abs(modality_ratio[alive]) <= 0.8).sum()}")
     if alignment_count[alignment_count > 0].size > 0:
         print(f"  Mean alignment (cross-modal):  {alignment_score[alignment_count > 0].mean():.4f}")
     print(f"  Mean frequency (alive):        {frequency[alive].mean():.4f}")
     print(f"{'='*60}")
 
-    # ---- Visualize ----
+    # Visualize
     visualize_3d(modality_ratio, alignment_score, frequency, output_dir)
 
     return modality_ratio, alignment_score, frequency
@@ -279,8 +258,7 @@ def main():
                         help="Directory for output metrics and visualizations")
     args = parser.parse_args()
 
-    data = load_all_chunks(args.cache_dir)
-    compute_metrics(data, args.output_dir)
+    compute_metrics_streaming(args.cache_dir, args.output_dir)
 
 
 if __name__ == "__main__":
