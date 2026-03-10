@@ -28,19 +28,25 @@ import dash
 from dash import dcc, html, Input, Output, State, callback_context, no_update
 
 from app.config import (
-    METRICS_PATH, TOPK_PATH, DATASET_PATH, MODEL_PATH, SAE_PATH,
+    DATASETS, DEFAULT_DATASET, MODEL_PATH, SAE_PATH,
     HOOK_NAME, STOP_LAYER, D_SAE, DEFAULT_PORT, TOPK_DISPLAY,
     RATIO_THRESH, FREQ_THRESH, CATEGORY_COLORS,
 )
 
 # ---------------------------------------------------------------------------
-# Data Manager
+# Data Manager — one per dataset
 # ---------------------------------------------------------------------------
 
 class DataManager:
-    def __init__(self):
-        print("Loading feature metrics ...")
-        m = np.load(METRICS_PATH)
+    _MISSING = object()
+
+    def __init__(self, ds_key, ds_config):
+        self.ds_key = ds_key
+        self.ds_config = ds_config
+        self._dataset_path = ds_config["dataset"]
+
+        print(f"Loading [{ds_key}] feature metrics ...")
+        m = np.load(ds_config["metrics"])
         self.modality_ratio = m["modality_ratio"]
         self.alignment = m["alignment"]
         self.frequency = m["frequency"]
@@ -49,8 +55,8 @@ class DataManager:
         self.sample_active = m["sample_active"]
         self.n_samples = int(m["n_samples"])
 
-        print("Loading top-K index ...")
-        t = np.load(TOPK_PATH)
+        print(f"Loading [{ds_key}] top-K index ...")
+        t = np.load(ds_config["topk"])
         self.topk_indices = t["topk_indices"]    # (d_sae, K)
         self.topk_values = t["topk_values"]      # (d_sae, K)
         self.topk_text_act = t["topk_text_act"]  # (d_sae, K)
@@ -60,7 +66,7 @@ class DataManager:
         self.alive = self.frequency > 0
 
         self._dataset = None
-        print(f"  {self.alive.sum()} alive features loaded.")
+        print(f"  [{ds_key}] {self.alive.sum()} alive features loaded.")
 
     def _classify(self):
         cats = np.full(D_SAE, "dead", dtype=object)
@@ -77,18 +83,16 @@ class DataManager:
                 cats[i] = "cross-modal"
         return cats
 
-    _MISSING = object()
-
     @property
     def dataset(self):
         if self._dataset is None:
-            if not os.path.exists(DATASET_PATH):
-                print(f"  WARNING: Dataset not found at {DATASET_PATH}")
+            if not os.path.exists(self._dataset_path):
+                print(f"  WARNING: Dataset not found at {self._dataset_path}")
                 self._dataset = self._MISSING
                 return None
             from datasets import load_from_disk
-            print(f"Loading dataset from {DATASET_PATH} ...")
-            self._dataset = load_from_disk(DATASET_PATH)
+            print(f"Loading dataset from {self._dataset_path} ...")
+            self._dataset = load_from_disk(self._dataset_path)
             print(f"  {len(self._dataset)} samples loaded.")
         return None if self._dataset is self._MISSING else self._dataset
 
@@ -114,6 +118,24 @@ class DataManager:
             return None, f"[Sample #{sample_idx} — dataset not available locally]"
         s = self.dataset[int(sample_idx)]
         return s["image"], s.get("question", "")
+
+
+# ---------------------------------------------------------------------------
+# DataManager cache — one per dataset key
+# ---------------------------------------------------------------------------
+
+_data_managers = {}
+
+
+def get_dm(ds_key):
+    if ds_key not in _data_managers:
+        if ds_key not in DATASETS:
+            raise ValueError(f"Unknown dataset key: {ds_key}")
+        cfg = DATASETS[ds_key]
+        if not os.path.exists(cfg["metrics"]):
+            return None
+        _data_managers[ds_key] = DataManager(ds_key, cfg)
+    return _data_managers[ds_key]
 
 
 # ---------------------------------------------------------------------------
@@ -498,11 +520,12 @@ def query_concept_llm(dm, feature_idx, api_key):
         for item in topk[:5]:
             try:
                 img, question = dm.get_sample(item["sample_idx"])
-                b64 = pil_to_b64(img, size=(256, 256), fmt="JPEG")
-                content.append({
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
-                })
+                if img is not None:
+                    b64 = pil_to_b64(img, size=(256, 256), fmt="JPEG")
+                    content.append({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
+                    })
                 content.append({
                     "type": "text",
                     "text": f"Question: {question} (activation: {item['total_act']:.1f})",
@@ -521,32 +544,66 @@ def query_concept_llm(dm, feature_idx, api_key):
 
 
 # ---------------------------------------------------------------------------
+# Build dataset dropdown options (only include datasets with available metrics)
+# ---------------------------------------------------------------------------
+
+def available_datasets():
+    options = []
+    for key, cfg in DATASETS.items():
+        if os.path.exists(cfg["metrics"]) and os.path.exists(cfg["topk"]):
+            options.append({"label": cfg["label"], "value": key})
+    return options
+
+
+# ---------------------------------------------------------------------------
 # Dash App
 # ---------------------------------------------------------------------------
 
-dm = DataManager()
 mm = ModelManager()
-scatter_fig = build_3d_scatter(dm)
+
+# Pre-load the default dataset
+_default_dm = get_dm(DEFAULT_DATASET)
+if _default_dm is None:
+    # Fallback: try any available dataset
+    for key in DATASETS:
+        _default_dm = get_dm(key)
+        if _default_dm is not None:
+            break
+if _default_dm is None:
+    print("ERROR: No dataset metrics found. Run the pipeline first.")
+    sys.exit(1)
 
 app = dash.Dash(__name__)
 app.title = "SAE-V Feature Explorer"
 
+_ds_options = available_datasets()
+_initial_ds = _default_dm.ds_key
+
 app.layout = html.Div([
     # Header
     html.Div([
+        html.Div([
+            dcc.Dropdown(
+                id="dataset-selector",
+                options=_ds_options,
+                value=_initial_ds,
+                clearable=False,
+                style={"width": "220px", "fontSize": "13px"},
+            ),
+        ], style={"flex": "0 0 230px"}),
         html.H1("SAE-V Feature Explorer",
-                style={"margin": "0", "fontSize": "22px"}),
-        html.Span(f"{dm.alive.sum():,} alive features from {dm.n_samples:,} samples",
-                  style={"color": "#888", "fontSize": "13px"}),
+                style={"margin": "0", "fontSize": "22px", "flex": "1",
+                        "textAlign": "center"}),
+        html.Span(id="header-stats",
+                  style={"color": "#888", "fontSize": "13px", "flex": "0 0 auto"}),
     ], style={"padding": "12px 20px", "borderBottom": "1px solid #ddd",
-              "display": "flex", "justifyContent": "space-between",
-              "alignItems": "center"}),
+              "display": "flex", "alignItems": "center", "gap": "10px"}),
 
     # Body
     html.Div([
         # Left: 3D scatter + controls
         html.Div([
-            dcc.Graph(id="scatter-3d", figure=scatter_fig,
+            dcc.Graph(id="scatter-3d",
                       style={"height": "78vh"},
                       config={"displayModeBar": True, "scrollZoom": True}),
             html.Div([
@@ -587,22 +644,49 @@ app.layout = html.Div([
 
     # Hidden stores
     dcc.Store(id="selected-feature", data=None),
+    dcc.Store(id="current-dataset", data=_initial_ds),
 ], style={"fontFamily": "system-ui, -apple-system, sans-serif"})
+
+
+# Callback: dataset selector → update scatter + header stats + clear panels
+@app.callback(
+    [Output("scatter-3d", "figure"),
+     Output("header-stats", "children"),
+     Output("current-dataset", "data"),
+     Output("feature-info", "children"),
+     Output("topk-samples", "children"),
+     Output("concept-desc", "children"),
+     Output("deep-dive-panel", "children")],
+    Input("dataset-selector", "value"),
+)
+def on_dataset_change(ds_key):
+    dm = get_dm(ds_key)
+    if dm is None:
+        return (no_update, "Dataset metrics not available", ds_key,
+                html.P("Dataset metrics not found.", style={"color": "#e74c3c"}),
+                "", "", "")
+
+    fig = build_3d_scatter(dm)
+    stats = f"{dm.alive.sum():,} alive features from {dm.n_samples:,} samples"
+    placeholder = html.P("Click a point in the 3D scatter to explore.",
+                         style={"color": "#999", "padding": "20px"})
+    return fig, stats, ds_key, placeholder, "", "", ""
 
 
 # Callback: click scatter OR manual input → update feature
 @app.callback(
     [Output("selected-feature", "data"),
-     Output("feature-info", "children"),
-     Output("topk-samples", "children"),
-     Output("concept-desc", "children"),
-     Output("deep-dive-panel", "children")],
+     Output("feature-info", "children", allow_duplicate=True),
+     Output("topk-samples", "children", allow_duplicate=True),
+     Output("concept-desc", "children", allow_duplicate=True),
+     Output("deep-dive-panel", "children", allow_duplicate=True)],
     [Input("scatter-3d", "clickData"),
      Input("go-btn", "n_clicks")],
-    [State("feature-id-input", "value")],
+    [State("feature-id-input", "value"),
+     State("current-dataset", "data")],
     prevent_initial_call=True,
 )
-def on_feature_select(click_data, go_clicks, manual_id):
+def on_feature_select(click_data, go_clicks, manual_id, ds_key):
     ctx = callback_context
     triggered = ctx.triggered[0]["prop_id"] if ctx.triggered else ""
 
@@ -617,6 +701,10 @@ def on_feature_select(click_data, go_clicks, manual_id):
     if feature_idx is None or feature_idx < 0 or feature_idx >= D_SAE:
         return no_update, no_update, no_update, no_update, no_update
 
+    dm = get_dm(ds_key)
+    if dm is None:
+        return no_update, no_update, no_update, no_update, no_update
+
     info = feature_info_card(dm, feature_idx)
     cards = sample_cards(dm, feature_idx)
 
@@ -627,10 +715,11 @@ def on_feature_select(click_data, go_clicks, manual_id):
 @app.callback(
     Output("deep-dive-panel", "children", allow_duplicate=True),
     Input({"type": "deep-dive-btn", "index": dash.ALL}, "n_clicks"),
-    State("selected-feature", "data"),
+    [State("selected-feature", "data"),
+     State("current-dataset", "data")],
     prevent_initial_call=True,
 )
-def on_deep_dive(n_clicks_list, feature_idx):
+def on_deep_dive(n_clicks_list, feature_idx, ds_key):
     if not any(n_clicks_list) or feature_idx is None:
         return no_update
 
@@ -641,6 +730,10 @@ def on_deep_dive(n_clicks_list, feature_idx):
     triggered_id = json.loads(ctx.triggered[0]["prop_id"].rsplit(".", 1)[0])
     sample_idx = triggered_id["index"]
 
+    dm = get_dm(ds_key)
+    if dm is None:
+        return no_update
+
     return deep_dive_result(mm, dm, feature_idx, sample_idx)
 
 
@@ -649,11 +742,16 @@ def on_deep_dive(n_clicks_list, feature_idx):
     Output("concept-desc", "children", allow_duplicate=True),
     Input("describe-btn", "n_clicks"),
     [State("selected-feature", "data"),
-     State("api-key-input", "value")],
+     State("api-key-input", "value"),
+     State("current-dataset", "data")],
     prevent_initial_call=True,
 )
-def on_describe(n_clicks, feature_idx, api_key):
+def on_describe(n_clicks, feature_idx, api_key, ds_key):
     if not n_clicks or feature_idx is None:
+        return no_update
+
+    dm = get_dm(ds_key)
+    if dm is None:
         return no_update
 
     desc = query_concept_llm(dm, feature_idx, api_key)
@@ -671,6 +769,7 @@ def main():
 
     print(f"\nStarting SAE-V Feature Explorer on port {args.port}")
     print(f"  Access: http://localhost:{args.port}")
+    print(f"  Available datasets: {[o['label'] for o in _ds_options]}")
     app.run(host="0.0.0.0", port=args.port, debug=args.debug)
 
 

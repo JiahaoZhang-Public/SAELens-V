@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "feature-explorer",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "app.feature_explorer", "--port", "8050", "--debug"],
+      "port": 8050
+    }
+  ]
+}

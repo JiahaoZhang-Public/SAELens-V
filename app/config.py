@@ -6,20 +6,45 @@ import os
 IS_SERVER = os.path.exists("/root/autodl-tmp")
 
 if IS_SERVER:
-    METRICS_PATH = "/root/autodl-tmp/feature_metrics_full/feature_metrics.npz"
-    TOPK_PATH = "/root/autodl-tmp/feature_metrics_full/topk_index.npz"
-    CACHE_DIR = "/root/autodl-tmp/activation_cache_full"
-    DATASET_PATH = "/root/projects/SAELens-V/dataset/RLAIF-V-Dataset-full"
-    MODEL_PATH = "/root/projects/SAELens-V/model/llava-v1.6-mistral-7b-hf"
-    SAE_PATH = "/root/projects/SAELens-V/model/SAE-V/SAEV_LLaVA_NeXT-7b_OBELICS"
+    _DATA_ROOT = "/root/autodl-tmp"
+    _PROJECT_ROOT = "/root/projects/SAELens-V"
+    MODEL_PATH = os.path.join(_PROJECT_ROOT, "model/llava-v1.6-mistral-7b-hf")
+    SAE_PATH = os.path.join(_PROJECT_ROOT, "model/SAE-V/SAEV_LLaVA_NeXT-7b_OBELICS")
 else:
-    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    METRICS_PATH = os.path.join(PROJECT_ROOT, "output/feature_metrics_full/feature_metrics.npz")
-    TOPK_PATH = os.path.join(PROJECT_ROOT, "output/feature_metrics_full/topk_index.npz")
-    CACHE_DIR = os.path.join(PROJECT_ROOT, "output/activation_cache_full")
-    DATASET_PATH = os.path.join(PROJECT_ROOT, "dataset/RLAIF-V-Dataset-full")
-    MODEL_PATH = os.path.join(PROJECT_ROOT, "model/llava-v1.6-mistral-7b-hf")
-    SAE_PATH = os.path.join(PROJECT_ROOT, "model/SAE-V/SAEV_LLaVA_NeXT-7b_OBELICS")
+    _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _DATA_ROOT = os.path.join(_PROJECT_ROOT, "output")
+    MODEL_PATH = os.path.join(_PROJECT_ROOT, "model/llava-v1.6-mistral-7b-hf")
+    SAE_PATH = os.path.join(_PROJECT_ROOT, "model/SAE-V/SAEV_LLaVA_NeXT-7b_OBELICS")
+
+# ---------------------------------------------------------------------------
+# Dataset registry — each entry has metrics, topk, cache, and dataset paths
+# ---------------------------------------------------------------------------
+
+DATASETS = {
+    "rlaif-v-full": {
+        "label": "RLAIF-V Full (83K)",
+        "metrics": os.path.join(_DATA_ROOT, "feature_metrics_full/feature_metrics.npz"),
+        "topk": os.path.join(_DATA_ROOT, "feature_metrics_full/topk_index.npz"),
+        "cache": os.path.join(_DATA_ROOT, "activation_cache_full"),
+        "dataset": os.path.join(_PROJECT_ROOT, "dataset/RLAIF-V-Dataset-full"),
+    },
+    "obelics-10k": {
+        "label": "OBELICS 10K",
+        "metrics": os.path.join(_DATA_ROOT, "feature_metrics_obelics10k/feature_metrics.npz"),
+        "topk": os.path.join(_DATA_ROOT, "feature_metrics_obelics10k/topk_index.npz"),
+        "cache": os.path.join(_DATA_ROOT, "activation_cache_obelics10k"),
+        "dataset": os.path.join(_PROJECT_ROOT, "dataset/OBELICS-10k"),
+    },
+}
+
+DEFAULT_DATASET = "rlaif-v-full"
+
+# Backwards compat — point to default dataset paths
+_default = DATASETS[DEFAULT_DATASET]
+METRICS_PATH = _default["metrics"]
+TOPK_PATH = _default["topk"]
+CACHE_DIR = _default["cache"]
+DATASET_PATH = _default["dataset"]
 
 # SAE config
 HOOK_NAME = "blocks.16.hook_resid_post"
