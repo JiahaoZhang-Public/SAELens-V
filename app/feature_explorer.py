@@ -77,14 +77,20 @@ class DataManager:
                 cats[i] = "cross-modal"
         return cats
 
+    _MISSING = object()
+
     @property
     def dataset(self):
         if self._dataset is None:
+            if not os.path.exists(DATASET_PATH):
+                print(f"  WARNING: Dataset not found at {DATASET_PATH}")
+                self._dataset = self._MISSING
+                return None
             from datasets import load_from_disk
             print(f"Loading dataset from {DATASET_PATH} ...")
             self._dataset = load_from_disk(DATASET_PATH)
             print(f"  {len(self._dataset)} samples loaded.")
-        return self._dataset
+        return None if self._dataset is self._MISSING else self._dataset
 
     def get_topk(self, feature_idx, k=TOPK_DISPLAY):
         vals = self.topk_values[feature_idx]
@@ -104,6 +110,8 @@ class DataManager:
         return results[:k]
 
     def get_sample(self, sample_idx):
+        if self.dataset is None:
+            return None, f"[Sample #{sample_idx} — dataset not available locally]"
         s = self.dataset[int(sample_idx)]
         return s["image"], s.get("question", "")
 
@@ -282,7 +290,7 @@ def feature_info_card(dm, fidx):
             "background": color, "color": "white", "padding": "3px 10px",
             "borderRadius": "12px", "fontSize": "13px", "fontWeight": "bold",
         }),
-        html.Table([
+        html.Table(html.Tbody([
             html.Tr([html.Td("Modality Ratio", style={"fontWeight": "bold"}),
                       html.Td(f"{dm.modality_ratio[fidx]:+.4f}")]),
             html.Tr([html.Td("Alignment", style={"fontWeight": "bold"}),
@@ -295,7 +303,7 @@ def feature_info_card(dm, fidx):
                       html.Td(f"{dm.mean_text[fidx]:.6f}")]),
             html.Tr([html.Td("Mean image act", style={"fontWeight": "bold"}),
                       html.Td(f"{dm.mean_image[fidx]:.6f}")]),
-        ], style={"marginTop": "10px", "fontSize": "13px", "width": "100%"}),
+        ]), style={"marginTop": "10px", "fontSize": "13px", "width": "100%"}),
     ], style={"padding": "12px", "background": "#f8f9fa", "borderRadius": "8px",
               "marginBottom": "12px"})
 
@@ -311,20 +319,24 @@ def sample_cards(dm, fidx, k=TOPK_DISPLAY):
         try:
             img, question = dm.get_sample(sid)
         except Exception:
-            continue
-        b64 = pil_to_b64(img)
+            img, question = None, f"[Sample #{sid}]"
+        b64 = pil_to_b64(img) if img is not None else None
         total = item["total_act"]
         t_act = item["text_act"]
         i_act = item["image_act"]
         t_frac = t_act / (total + 1e-8) * 100
         i_frac = i_act / (total + 1e-8) * 100
 
+        img_el = (html.Img(src=f"data:image/jpeg;base64,{b64}",
+                          style={"width": "120px", "height": "120px",
+                                 "objectFit": "cover", "borderRadius": "6px"})
+                  if b64 else html.Div("No image", style={
+                      "width": "120px", "height": "120px", "background": "#ddd",
+                      "borderRadius": "6px", "display": "flex",
+                      "alignItems": "center", "justifyContent": "center",
+                      "fontSize": "11px", "color": "#888"}))
         card = html.Div([
-            html.Div([
-                html.Img(src=f"data:image/jpeg;base64,{b64}",
-                         style={"width": "120px", "height": "120px",
-                                "objectFit": "cover", "borderRadius": "6px"}),
-            ], style={"flex": "0 0 120px"}),
+            html.Div([img_el], style={"flex": "0 0 120px"}),
             html.Div([
                 html.Div(f"#{rank+1}  Sample {sid}  (act={total:.1f})",
                          style={"fontWeight": "bold", "fontSize": "12px",
@@ -359,6 +371,9 @@ def sample_cards(dm, fidx, k=TOPK_DISPLAY):
 
 def deep_dive_result(mm, dm, feature_idx, sample_idx):
     img, question = dm.get_sample(sample_idx)
+    if img is None:
+        return html.P("Dataset not available locally. Deep Dive requires the full dataset.",
+                       style={"color": "#e74c3c"})
     result = mm.run_on_sample(img, question, feature_idx)
 
     text_acts = result["text_activations"]
