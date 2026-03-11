@@ -116,7 +116,10 @@ class DataManager:
     def get_sample(self, sample_idx):
         if self.dataset is None:
             return None, f"[Sample #{sample_idx} — dataset not available locally]"
-        s = self.dataset[int(sample_idx)]
+        idx = int(sample_idx)
+        if idx >= len(self.dataset):
+            return None, f"[Sample #{idx} — out of range (dataset has {len(self.dataset)} samples)]"
+        s = self.dataset[idx]
         return s["image"], s.get("question", "")
 
 
@@ -394,9 +397,17 @@ def sample_cards(dm, fidx, k=TOPK_DISPLAY):
 def deep_dive_result(mm, dm, feature_idx, sample_idx):
     img, question = dm.get_sample(sample_idx)
     if img is None:
-        return html.P("Dataset not available locally. Deep Dive requires the full dataset.",
+        return html.P(f"Cannot load sample #{sample_idx}. {question}",
                        style={"color": "#e74c3c"})
-    result = mm.run_on_sample(img, question, feature_idx)
+    try:
+        result = mm.run_on_sample(img, question, feature_idx)
+    except (ImportError, ModuleNotFoundError) as e:
+        return html.P(
+            f"Deep Dive requires TransformerLens-V (HookedLlava) and a GPU. "
+            f"Missing module: {e.name}",
+            style={"color": "#e74c3c"})
+    except Exception as e:
+        return html.P(f"Deep Dive error: {e}", style={"color": "#e74c3c"})
 
     text_acts = result["text_activations"]
     img_acts = result["image_activations"]
